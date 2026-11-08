@@ -11,6 +11,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include "wifi_scan.hpp"
+
 namespace {
 
 // Events are recorded into a small ring buffer from the event tasks and
@@ -26,6 +28,9 @@ struct record_t {
     uint8_t aid;
     source_t src;
     bool is_ip_event;
+    int32_t extra;  // scan: AP count; STA disconnect: reason
+    int32_t extra2; // scan: status (0 = ok)
+    char ssid[33];
 };
 
 constexpr size_t ring_len = 64;
@@ -116,6 +121,15 @@ void sys_handler(void*, esp_event_base_t base, int32_t id, void* data) {
             auto e = (wifi_event_ap_stadisconnected_t*)data;
             memcpy(r.mac, e->mac, 6);
             r.aid = e->aid;
+        } else if (id == WIFI_EVENT_SCAN_DONE && data) {
+            auto e   = (wifi_event_sta_scan_done_t*)data;
+            r.extra  = e->number;
+            r.extra2 = e->status;
+        } else if (id == WIFI_EVENT_STA_DISCONNECTED && data) {
+            auto e  = (wifi_event_sta_disconnected_t*)data;
+            r.extra = e->reason;
+            memcpy(r.mac, e->bssid, 6);
+            memcpy(r.ssid, e->ssid, e->ssid_len < 32 ? e->ssid_len : 32);
         }
     } else {
         r.is_ip_event = true;
@@ -199,6 +213,13 @@ void print_record(const record_t& r) {
     if (r.ip) {
         log_printf(" ip=" IPSTR, IP2STR((esp_ip4_addr_t*)&r.ip));
     }
+    if (r.src == src_sys && !r.is_ip_event) {
+        if (r.id == WIFI_EVENT_SCAN_DONE) {
+            log_printf(" found=%d status=%d", (int)r.extra, (int)r.extra2);
+        } else if (r.id == WIFI_EVENT_STA_DISCONNECTED) {
+            log_printf(" ssid='%s' reason=%d", r.ssid, (int)r.extra);
+        }
+    }
     log_printf(" (printed +%ums)\n", (unsigned)(millis() - r.ms));
 }
 
@@ -250,10 +271,24 @@ void print_tick_rate(void) {
     last_tic = tic;
 }
 
+// Prints the SSID list each time a scan replaces it (from wifi_scan).
+void print_scan_results(void) {
+    static std::vector<std::string> last;
+    std::vector<std::string> now = wifi_scan::results();
+    if (now == last) return;
+    last.swap(now);
+    log_printf("[%7u][APDIAG] scan list: %u SSIDs\n", (unsigned)millis(),
+               (unsigned)last.size());
+    for (size_t i = 0; i < last.size(); ++i) {
+        log_printf("[APDIAG]   %2u '%s'\n", (unsigned)i, last[i].c_str());
+    }
+}
+
 void heartbeat(void) {
     static bool cfg_printed = false;
     static uint8_t tick_div = 0;
     if ((tick_div++ % 5) == 0) print_tick_rate();  // every ~10 s
+    print_scan_results();
 
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_wifi_get_mode(&mode);
@@ -276,7 +311,7 @@ void heartbeat(void) {
     esp_wifi_get_channel(&primary, &second);
 
     log_printf("[%7u][APDIAG] hb ch=%u scan=%d heap=%u min=%u stations=%d",
-                  (unsigned)millis(), primary, (int)WiFi.scanComplete(),
+                  (unsigned)millis(), primary, (int)wifi_scan::running(),
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
                   have_list ? nl.num : -1);
     if (have_list) {
