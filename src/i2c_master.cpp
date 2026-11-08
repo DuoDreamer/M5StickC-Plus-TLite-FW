@@ -178,6 +178,9 @@ void IRAM_ATTR I2C_Master::i2c_stop(void) {
         gpio_set_level(_pin_scl, 0);
     }
     gpio_set_level(_pin_sda, 0);  // setup for STOP
+    // Called on every forced stop (reference count only grows). Enabling it
+    // just once was tried and broke sensor detection on the device, so the
+    // original behaviour is kept.
     periph_module_enable(mod);
     gpio_set_level(_pin_scl, 1);
     periph_module_reset(mod);
@@ -200,7 +203,10 @@ bool IRAM_ATTR I2C_Master::i2c_wait(bool flg_stop) {
         return res;
     }
 
+    // Zero when no ACK is pending, so the stop path below takes the safe
+    // forced-stop branch instead of testing an uninitialised value.
     typeof(i2c_dev->int_raw) int_raw;
+    int_raw.val = 0;
     static constexpr uint32_t intmask = I2C_ACK_ERR_INT_RAW_M |
                                         I2C_END_DETECT_INT_RAW_M |
                                         I2C_ARBITRATION_LOST_INT_RAW_M;
@@ -277,9 +283,11 @@ bool IRAM_ATTR I2C_Master::_readword_inner(i2c_dev_t *dev, uint8_t *data,
                                            size_t length, bool last_nack) {
     size_t len = ((length - 1) & 127) + 1;
     length -= len;
+    // Also runs inside the IRAM interrupt handler, possibly while the flash
+    // cache is disabled, so no logging here (ESP_LOGW lives in flash); the
+    // task-side caller logs instead.
     auto res = i2c_wait(false);
     if (!res) {
-        ESP_LOGW("I2C_Master", "readWords error : ack wait");
         return false;
     }
 
@@ -292,10 +300,12 @@ bool IRAM_ATTR I2C_Master::_readword_inner(i2c_dev_t *dev, uint8_t *data,
     i2c_set_cmd(dev, 2, i2c_cmd_end, 0);
     updateDev(dev);
 
+    // RXFIFO_OVF: a READ command can receive up to 255 bytes into the 32-byte
+    // FIFO; if the ISR is late, bytes are lost and the frame would be shifted.
     static constexpr uint32_t intmask =
         I2C_ACK_ERR_INT_RAW_M | I2C_TIME_OUT_INT_RAW_M |
-        I2C_RXFIFO_FULL_INT_RAW_M | I2C_END_DETECT_INT_RAW_M |
-        I2C_ARBITRATION_LOST_INT_RAW_M;
+        I2C_RXFIFO_FULL_INT_RAW_M | I2C_RXFIFO_OVF_INT_RAW_M |
+        I2C_END_DETECT_INT_RAW_M | I2C_ARBITRATION_LOST_INT_RAW_M;
     dev->int_clr.val     = ~0u;
     dev->int_ena.val     = intmask;
     dev->ctr.trans_start = 1;
@@ -328,22 +338,36 @@ void IRAM_ATTR I2C_Master::_isr_handler(void *arg) {
             }
             me->_isr_recv_buf      = dst;
             me->_isr_recv_done_len = recv_done_len;
+            bool finished          = false;
             if (int_sts.ack_err || int_sts.time_out ||
-                int_sts.arbitration_lost) {
+                int_sts.arbitration_lost || int_sts.rx_fifo_ovf) {
+                // Fail now instead of letting a later chunk overwrite the
+                // error, and wake the reader instead of waiting for timeout.
                 me->_isr_result = false;
-            }
-            if (int_sts.end_detect) {
+                finished        = true;
+            } else if (int_sts.end_detect) {
                 if (me->_isr_recv_remain_len) {
-                    me->_isr_result = me->_readword_inner(
-                        dev, dst, me->_isr_recv_remain_len, true);
+                    if (!me->_readword_inner(dev, dst,
+                                             me->_isr_recv_remain_len, true)) {
+                        me->_isr_result = false;
+                        finished        = true;
+                    }
                 } else {
-                    if (me->_isr_semaphore) {
-                        BaseType_t xHigherPriorityTaskWoken = pdTRUE;
-                        xSemaphoreGiveFromISR(me->_isr_semaphore,
-                                              &xHigherPriorityTaskWoken);
+                    finished = true;
+                }
+            }
+            if (finished) {
+                me->_isr_mode = isr_mode_t::isr_nojob;
+                dev->int_ena.val = 0;
+                if (me->_isr_semaphore) {
+                    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+                    xSemaphoreGiveFromISR(me->_isr_semaphore,
+                                          &xHigherPriorityTaskWoken);
+                    if (xHigherPriorityTaskWoken) {
                         portYIELD_FROM_ISR();
                     }
                 }
+                break;
             }
         }
     } while (dev->int_status.val);
@@ -361,17 +385,40 @@ bool I2C_Master::init(int i2c_port, int pin_sda, int pin_scl) {
     i2c_stop();
     this->load_reg();
 
-    esp_intr_alloc(getPeriphIntSource(i2c_port),
-                   ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3, _isr_handler,
-                   this, nullptr);
-
+    // init() runs again after every bus error; allocate the interrupt and
+    // the semaphore only once (the former code leaked an interrupt per call).
+    if (_intr_handle == nullptr &&
+        esp_intr_alloc(getPeriphIntSource(i2c_port),
+                       ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL3, _isr_handler,
+                       this, &_intr_handle) != ESP_OK) {
+        _intr_handle = nullptr;
+        return false;
+    }
+    if (_isr_semaphore == nullptr) {
+        _isr_semaphore = xSemaphoreCreateBinary();
+        if (_isr_semaphore == nullptr) return false;
+    }
+    _state = state_t::state_disconnect;
     return true;
 }
 
 bool I2C_Master::release(void) {
-    gpio_reset_pin((gpio_num_t)_pin_sda);
-    gpio_reset_pin((gpio_num_t)_pin_scl);
+    // The pins are unknown until the first init().
+    if (_pin_sda != GPIO_NUM_NC) gpio_reset_pin(_pin_sda);
+    if (_pin_scl != GPIO_NUM_NC) gpio_reset_pin(_pin_scl);
     return true;
+}
+
+void I2C_Master::abort(void) {
+    if (_pin_sda == GPIO_NUM_NC || _pin_scl == GPIO_NUM_NC) return;
+    auto dev     = get_i2c_dev(_i2c_port);
+    _isr_mode    = isr_mode_t::isr_nojob;
+    dev->int_ena.val = 0;
+    dev->int_clr.val = ~0u;
+    _wait_ack    = false;
+    i2c_stop();  // clock out a stuck slave, STOP, reset the controller
+    load_reg();
+    _state = state_t::state_disconnect;
 }
 
 bool I2C_Master::setFreq(uint32_t freq) {
@@ -738,21 +785,43 @@ bool I2C_Master::readWords(uint16_t *readdata, size_t length, bool last_nack,
     if (i2c_dev == nullptr) {
         return false;
     }
+    if (_isr_semaphore == nullptr) {
+        return false;  // init() not called or failed
+    }
     if (freq) {
-        i2c_wait(false);
+        // Wait for the address phase; a NACK here means nobody answered.
+        if (!i2c_wait(false)) {
+            return false;
+        }
         setFreq(freq);
+    } else {
+        freq = _freq;
+    }
+    if (freq < 8) {
+        freq = 100000;  // avoid dividing by zero below
     }
 
-    _isr_semaphore     = xSemaphoreCreateBinary();
+    xSemaphoreTake(_isr_semaphore, 0);  // drop a stale completion, if any
+    _isr_result        = true;  // reset: the ISR only ever clears it
     _isr_recv_done_len = 0;
-    _readword_inner(get_i2c_dev(_i2c_port), (uint8_t *)readdata, length,
-                    last_nack);
+    if (!_readword_inner(get_i2c_dev(_i2c_port), (uint8_t *)readdata, length,
+                         last_nack)) {
+        ESP_LOGW("I2C_Master", "readWords error : ack wait");
+        return false;
+    }
     // 想定の8倍の時間(+10 msec)で応答が得られなければ通信失敗と見なして帰る
     auto result = xSemaphoreTake(_isr_semaphore,
                                  ((18 * 1000 * length) / (freq >> 3)) + 10);
-    vSemaphoreDelete(_isr_semaphore);
-    _isr_semaphore = nullptr;
-    return _isr_result && (result == pdTRUE);
+    if (result != pdTRUE) {
+        // Timed out: disarm the ISR before returning, so it cannot keep
+        // writing into the caller's buffer (often a stack array).
+        _isr_mode        = isr_mode_t::isr_nojob;
+        i2c_dev->int_ena.val = 0;
+        _state           = state_t::state_error;
+        return false;
+    }
+    // A short read would leave the end of the buffer stale.
+    return _isr_result && _isr_recv_done_len == length;
 }
 /*
 bool I2C_Master::readWords(uint16_t *readdata, size_t length, bool last_nack) {
