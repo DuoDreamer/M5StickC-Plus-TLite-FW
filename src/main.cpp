@@ -3174,12 +3174,6 @@ void setup(void) {
     display.setRotation(1);
     display.drawBmp(bmp_logo, sizeof(bmp_logo), 0, 0, display.width(),
                     display.height(), 0, 0, 1.0f, 1.0f, datum_t::middle_center);
-    display.setFont(&fonts::Font0);
-    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    display.setTextDatum(datum_t::bottom_right);
-    display.drawString("v" TLITE_FW_VERSION, display.width() - 2,
-                       display.height() - 1);
-    display.setTextDatum(datum_t::top_left);
 
     {
         auto cfg             = M5.Speaker.config();
@@ -3297,8 +3291,7 @@ void setup(void) {
     {
         static constexpr size_t line_len = 64;
         char lines[6][line_len]          = {""};
-        snprintf(lines[0], line_len, "ver:%d.%d.%d", firmware_ver_major,
-                 firmware_ver_minor, firmware_ver_patch);
+        snprintf(lines[0], line_len, "ver:%s", TLITE_FW_VERSION);
         size_t line_idx = 1;
         snprintf(lines[line_idx++], line_len, "Sensor:%s/%d%%",
                  draw_param.sens_refreshrate.getText(),
