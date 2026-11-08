@@ -25,8 +25,8 @@ static constexpr const char HTTP_200_json[] =
     "charset=UTF-8\r\nX-Content-Type-Options: nosniff\r\nConnection: "
     "close\r\nCache-Control: no-cache\r\n\r\n";
 static constexpr const char HTML_footer[] =
-    "<div class='ft'>Copyright &copy;2022 "
-    "M5Stack</div></div>\n</body></html>\n\n";
+    "<div class='ft'>T-Lite firmware " TLITE_FW_VERSION
+    " &middot; Copyright &copy;2022 M5Stack</div></div>\n</body></html>\n\n";
 
 static constexpr const char HTML_style[] =
     "<style>"
@@ -836,6 +836,7 @@ static bool response_health(draw_param_t* draw_param, connection_t* conn) {
     const int formatted_len = snprintf(
         body, sizeof(body),
         "{\n"
+        "  \"version\": \"" TLITE_FW_VERSION "\",\n"
         "  \"uptime_ms\": %lu,\n"
         "  \"heap\": {\n"
         "    \"free_8bit\": %u,\n"

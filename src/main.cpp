@@ -3311,8 +3311,7 @@ void setup(void) {
     {
         static constexpr size_t line_len = 64;
         char lines[6][line_len]          = {""};
-        snprintf(lines[0], line_len, "ver:%d.%d.%d", firmware_ver_major,
-                 firmware_ver_minor, firmware_ver_patch);
+        snprintf(lines[0], line_len, "ver:%s", TLITE_FW_VERSION);
         size_t line_idx = 1;
         snprintf(lines[line_idx++], line_len, "Sensor:%s/%d%%",
                  draw_param.sens_refreshrate.getText(),
