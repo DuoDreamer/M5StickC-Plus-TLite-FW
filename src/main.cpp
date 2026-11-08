@@ -46,6 +46,7 @@ draw_param_t draw_param;
 volatile bool need_wifi_reconnect = false;
 
 extern "C" {
+#include <freertos/xtensa_timer.h>  // _xt_tick_divisor, XT_TICK_PER_SEC
 void esp_timer_impl_update_apb_freq(
     uint32_t apb_ticks_per_us);  // private in IDF
 }
@@ -1767,13 +1768,21 @@ void config_param_t::misc_volume_func(misc_volume_t v) {
 }
 
 void config_param_t::misc_cpuspeed_func(misc_cpuspeed_t v) {
-    // draw_param.misc_cpuspeed = v;
-    // setCpuFrequencyMhz(misc_cpuspeed_value[v]);
+    // Same steps as Arduino's setCpuFrequencyMhz(), minus its APB-change
+    // callbacks: the SPI callback takes the Arduino SPI bus lock, which
+    // drawTask holds permanently (display.startWrite()), so calling
+    // setCpuFrequencyMhz() after drawTask has started deadlocks the caller.
+    // The callbacks are not needed: APB stays at 80 MHz for 80/160/240 MHz.
     rtc_cpu_freq_config_t _cpu_freq_conf;
     rtc_clk_cpu_freq_get_config(&_cpu_freq_conf);
-    auto new_cpuspeed = misc_cpuspeed_value[v];
-    bool reconnect    = _cpu_freq_conf.freq_mhz > 160 || new_cpuspeed > 160;
-    rtc_clk_cpu_freq_mhz_to_config(new_cpuspeed, &_cpu_freq_conf);
+    uint32_t old_cpuspeed = _cpu_freq_conf.freq_mhz;
+    uint32_t new_cpuspeed = misc_cpuspeed_value[v];
+    if (old_cpuspeed == new_cpuspeed) {
+        return;
+    }
+    if (!rtc_clk_cpu_freq_mhz_to_config(new_cpuspeed, &_cpu_freq_conf)) {
+        return;
+    }
     rtc_clk_cpu_freq_set_config_fast(&_cpu_freq_conf);
     uint32_t apb = 80 * MHZ;
     if (_cpu_freq_conf.freq_mhz < 80) {
@@ -1781,8 +1790,15 @@ void config_param_t::misc_cpuspeed_func(misc_cpuspeed_t v) {
     }
     rtc_clk_apb_freq_update(apb);
     esp_timer_impl_update_apb_freq(apb / MHZ);
+    // The FreeRTOS tick timer counts CPU cycles. Without this update the
+    // 1 ms tick ran at old/new speed (2/3 speed at the default 160 MHz after
+    // booting at 240 MHz), so every delay and timeout was 1.5x too long.
+    uint32_t fcpu = (_cpu_freq_conf.freq_mhz >= 80)
+                        ? (_cpu_freq_conf.freq_mhz * MHZ)
+                        : apb;
+    _xt_tick_divisor = fcpu / XT_TICK_PER_SEC;
 
-    if (reconnect) {
+    if (old_cpuspeed > 160 || new_cpuspeed > 160) {
         need_wifi_reconnect = true;
     }
 }

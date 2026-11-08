@@ -225,8 +225,8 @@ void print_record(const record_t& r) {
 
 // Prints the soft-AP configuration actually held by the driver, the real
 // CPU/APB clocks, and how fast the FreeRTOS tick runs relative to millis().
-// (main.cpp's misc_cpuspeed_func changes clocks without updating the tick
-// divisor; a skewed tick would show up here as ticks_ms != wall_ms.)
+// (A CPU clock change that skips the tick divisor update shows up here as
+// ticks_ms != wall_ms.)
 void print_ap_config(void) {
     wifi_config_t c = {};
     if (esp_wifi_get_config(WIFI_IF_AP, &c) != ESP_OK) {
