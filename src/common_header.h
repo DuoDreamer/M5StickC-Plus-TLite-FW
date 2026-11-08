@@ -7,6 +7,11 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 
+// Firmware version, set from custom_firmware_version in platformio.ini.
+#ifndef TLITE_FW_VERSION
+#define TLITE_FW_VERSION "unknown"
+#endif
+
 // printf-style formatting into std::string.
 //
 // Replaces the former `dst.append(cbuf, snprintf(cbuf, sizeof(cbuf), ...))`
