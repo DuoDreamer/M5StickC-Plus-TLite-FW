@@ -636,7 +636,28 @@ class config_property_value_t : public config_property_base_t {
     int32_t get(void) const override {
         return _value;
     }
+    T minimum(void) const {
+        return _minimum;
+    }
+    T maximum(void) const {
+        return _maximum;
+    }
     bool set(const int32_t src) override {
+        return assign(src, true);
+    }
+    // Runtime-only change (e.g. auto range): does not schedule an NVS save.
+    // The value is still written if a save happens for another reason.
+    bool setNoSave(const int32_t src) {
+        return assign(src, false);
+    }
+    bool add(int32_t val) override {
+        auto range = _maximum - _minimum + 1;
+        val        = (val * _step + get() + range - _minimum) % range;
+        return set(val + _minimum);
+    }
+
+   private:
+    bool assign(const int32_t src, bool save) {
         // _maximum is inclusive (see add()); the former clamp to
         // _maximum + 1 accepted one value past the range (e.g. JPEG quality
         // 101, which jpge rejects, stopping the LAN stream).
@@ -645,19 +666,16 @@ class config_property_value_t : public config_property_base_t {
                                              : src);
         bool result = (_value != v);
         if (result) {
-            config_save_countdown = 255;
-            _value                = (T)v;
+            if (save) {
+                config_save_countdown = 255;
+            }
+            _value = (T)v;
         }
         _text_func(_text_buf, sizeof(_text_buf), v);
         if (_change_func) {
             _change_func(v);
         }
         return result;
-    }
-    bool add(int32_t val) override {
-        auto range = _maximum - _minimum + 1;
-        val        = (val * _step + get() + range - _minimum) % range;
-        return set(val + _minimum);
     }
 };
 
