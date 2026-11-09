@@ -3417,7 +3417,9 @@ void loop(void) {
     static uint32_t _alarm_last_time = 0;
     static uint32_t _alarm_interval  = 500;
     // 温度アラーム判定
-    if (((msec - _alarm_last_time) > _alarm_interval)) {
+    // idx_recv is -1 until the first frame arrives; framedata[-1] is outside
+    // the array and could raise a false alarm at boot.
+    if (idx_recv >= 0 && ((msec - _alarm_last_time) > _alarm_interval)) {
         auto frame   = &framedata[idx_recv];
         int temp_idx = 0;
         switch (draw_param.alarm_reference) {
@@ -3605,8 +3607,11 @@ void loop(void) {
     } else if (!draw_param.in_pause_state) {
         int idx_recv_next = (idx_recv + 1) % framedata_len;
         auto frame        = &framedata[idx_recv_next];
-        auto prev_frame   = &framedata[idx_recv % framedata_len];
-        memcpy(frame, prev_frame, sizeof(framedata_t));
+        // No previous frame before the first one (idx_recv == -1, and
+        // -1 % framedata_len is -1): keep the zero-initialised slot.
+        if (idx_recv >= 0) {
+            memcpy(frame, &framedata[idx_recv], sizeof(framedata_t));
+        }
         // Obtain temperature data structure.
         auto temp_data = command_processor::getTemperatureData();
 
