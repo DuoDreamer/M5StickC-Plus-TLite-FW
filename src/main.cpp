@@ -472,9 +472,27 @@ bool draw_param_t::range_update(void) {
     int32_t margin  = ((highest - lowest) >> 4) + 1;
     lowest          = _lowest_value.exec(lowest - margin, margin);
     highest         = _highest_value.exec(highest + margin, margin);
+    // Keep the range inside the property limits and non-empty. The two
+    // smoothed values can cross after a fast scene change, and clamping a
+    // scene beyond the limits could make them equal; either would let
+    // range_temperature_func "correct" (and save) the range, or leave
+    // temp_diff <= 0 for the renderers that divide by it.
+    lowest  = std::max(lowest, range_temp_lower.minimum());
+    lowest  = std::min(lowest, range_temp_upper.maximum() - 1);
+    highest = std::min(highest, range_temp_upper.maximum());
+    highest = std::max(highest, lowest + 1);
     if (range_temp_lower != lowest || range_temp_upper != highest) {
-        range_temp_lower = lowest;
-        range_temp_upper = highest;
+        // Auto range follows the scene; do not schedule an NVS save for each
+        // change (that rewrote flash a few seconds after every scene change).
+        // Assign in the order that keeps lower < upper, so
+        // range_temperature_func does not correct (and save) the range.
+        if (lowest >= range_temp_upper) {
+            range_temp_upper.setNoSave(highest);
+            range_temp_lower.setNoSave(lowest);
+        } else {
+            range_temp_lower.setNoSave(lowest);
+            range_temp_upper.setNoSave(highest);
+        }
         temp_diff        = (highest - lowest) + 1;
         ++modify_count;
         return true;
