@@ -602,13 +602,25 @@ static bool response_text(draw_param_t* draw_param, connection_t* conn) {
 
 static bool response_stream(draw_param_t* draw_param, connection_t* conn) {
     auto client = &conn->client;
+    // Only this task adds viewers (streamTask only removes them), so a free
+    // slot seen here is still free in addViewer() below.
+    if (!screenshot_holder.hasFreeSlot()) {
+        client->print(
+            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+            "Content-Type: text/plain\r\nContent-Length: 26\r\n\r\n"
+            "Too many stream viewers.\r\n");
+        return false;
+    }
+    // Headers go out first: frames may start as soon as streamTask has the
+    // client.
     client->print("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n");
     client->print("Content-type: multipart/x-mixed-replace;boundary=");
     client->print(conn->boundary);
     client->print("\r\n");
-    screenshot_holder.requestScreenShot(client);
-    // JPEGストリームを受け取るため戻り値をtrue (keep connection)にする
-    return true;
+    screenshot_holder.addViewer(*client);  // fails only when out of memory
+    // streamTask now owns the stream; this slot drops its handle (the socket
+    // stays open) and is free for the next request.
+    return false;
 }
 
 static bool response_wifi(draw_param_t* draw_param, connection_t* conn) {
