@@ -35,8 +35,11 @@ IMU, which is absent from the Plus SE.
 4. Select a nearby network from the SSID list, enter its password, and save.
 5. Reconnect the phone to the same local network as T-Lite.
 
+The setup access point accepts one phone at a time. If another device is
+already joined, disconnect it first.
+
 If the SSID list is still being populated, wait for the page to refresh or select
-**Refresh networks**. When all phones leave the setup access point, T-Lite shows
+**Refresh networks**. When the phone leaves the setup access point, T-Lite shows
 the Wi-Fi connection QR code again.
 
 ## Browser access
@@ -51,6 +54,10 @@ After Wi-Fi setup, the Network menu provides QR codes for local access.
 The home page links to browser control, text and JSON temperature data, system
 health, and the MJPEG stream. If the network or phone does not support mDNS, use
 the IP address instead.
+
+The MJPEG stream serves one browser at a time. While it is in use, other
+requests for it get "Too many stream viewers"; close the other stream first. A
+viewer that stops receiving data for about 2 seconds is disconnected.
 
 The mDNS hostname changed from `T-Lite_xxxx.local` to `t-lite-xxxx.local`. Update
 saved bookmarks created with older firmware.
