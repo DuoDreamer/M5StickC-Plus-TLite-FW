@@ -8,6 +8,7 @@
 #include <driver/gpio.h>
 
 #include <mutex>
+#include <new>
 #include <vector>
 
 #include <Preferences.h>
@@ -23,6 +24,10 @@
 #include "wifi_diag.hpp"
 #include "wifi_scan.hpp"
 #include "jpg/jpge.h"
+
+// After the Arduino headers: lwIP defines INADDR_NONE as a macro, which
+// breaks Arduino's IPAddress INADDR_NONE if it comes first.
+#include <lwip/sockets.h>
 
 #include "resource/bmp_logo.h"
 #include "resource/jpg_staff.h"
@@ -561,13 +566,29 @@ screenshot_streamer_t::screenshot_streamer_t(void) {
     _queue_bufdata =
         xQueueCreate(2, sizeof(screenshot_streamer_t::queue_bufdata_t));
 
-    // スクリーンショット更新の順番待ちができるクライアント（ブラウザ）の数
-    _queue_client = xQueueCreate(4, sizeof(WiFiClient*));
+    // New viewers waiting to be adopted by streamTask.
+    _queue_client = xQueueCreate(viewer_max, sizeof(WiFiClient*));
 }
 
-void screenshot_streamer_t::requestScreenShot(WiFiClient* client) {
-    xQueueSendToBack(_queue_client, &client, 0);
-    _is_requested = true;
+bool screenshot_streamer_t::addViewer(const WiFiClient& client) {
+    if (_viewer_count.fetch_add(1) >= viewer_max) {
+        --_viewer_count;
+        return false;
+    }
+    // A copy shares the socket; it is closed when the last handle is gone.
+    // The web task used to queue a pointer to its own connection slot, which
+    // it stopped and reused for the next request while streamTask was still
+    // writing to it (JPEG data could go to another client).
+    auto viewer = new (std::nothrow) WiFiClient();
+    if (viewer) {
+        *viewer = client;
+        if (pdPASS == xQueueSendToBack(_queue_client, &viewer, 0)) {
+            return true;
+        }
+        delete viewer;
+    }
+    --_viewer_count;
+    return false;
 }
 /*
 #include <lwip/sockets.h> // for 'send' function
@@ -620,26 +641,92 @@ socketFileDescriptor, errno, strerror(errno)); if(errno != EAGAIN) {
     return totalBytesSent;
 }
 //*/
-void screenshot_streamer_t::streamTask(void* arg) {
-    auto me = (screenshot_streamer_t*)arg;
-    queue_bufdata_t qd;
-    auto& cl = me->_wifi_client;
-    while (pdTRUE == xQueueReceive(me->_queue_bufdata, &qd, portMAX_DELAY)) {
-        auto len = qd.len;
-        auto buf = qd.bufdata;
-        if (qd.y0) {
-            xQueueReceive(me->_queue_client, &cl, 0);
-        }
-        if (cl == nullptr) {
+// A viewer must take a whole frame within this time, or it is dropped.
+// WiFiClient::write() retried each chunk for up to 10 x 1 s, and meanwhile
+// the encoder (web task) and the display task waited on the stream queues,
+// so one stalled browser froze the web server and slowed the LCD.
+static constexpr const uint32_t stream_frame_timeout_ms = 2000;
+// Upper bound for the encoder waiting on streamTask; streamTask is limited by
+// stream_frame_timeout_ms, so this only guards against the unexpected.
+static constexpr const uint32_t stream_queue_timeout_ms = 3000;
+
+// Sends all of buf without blocking past deadline (millis()).
+static bool stream_send(int fd, const uint8_t* buf, size_t len,
+                        uint32_t deadline) {
+    while (len) {
+        int res = send(fd, buf, len, MSG_DONTWAIT);
+        if (res > 0) {
+            buf += res;
+            len -= res;
             continue;
         }
-        if (cl->connected()) {
-            if (len == cl->write(buf, len)) {
-                continue;
-            }
-            cl->stop();
+        if (res < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
         }
-        cl = nullptr;
+        int32_t remain = int32_t(deadline - millis());
+        if (remain <= 0) {
+            return false;
+        }
+        fd_set set;
+        FD_ZERO(&set);
+        FD_SET(fd, &set);
+        struct timeval tv;
+        tv.tv_sec  = remain / 1000;
+        tv.tv_usec = (remain % 1000) * 1000;
+        if (select(fd + 1, nullptr, &set, nullptr, &tv) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void screenshot_streamer_t::streamTask(void* arg) {
+    auto me = (screenshot_streamer_t*)arg;
+    // Only this task touches the viewers; frames go to them in turn.
+    WiFiClient* viewers[viewer_max] = {};
+    int current       = -1;  // viewer receiving the current frame
+    uint32_t deadline = 0;
+    queue_bufdata_t qd;
+    while (pdTRUE == xQueueReceive(me->_queue_bufdata, &qd, portMAX_DELAY)) {
+        if (qd.y0) {
+            // Adopt new viewers at a frame boundary. _viewer_count limits
+            // them to the free slots.
+            WiFiClient* added;
+            while (pdTRUE == xQueueReceive(me->_queue_client, &added, 0)) {
+                for (auto& v : viewers) {
+                    if (!v) {
+                        v     = added;
+                        added = nullptr;
+                        break;
+                    }
+                }
+                if (added) {
+                    delete added;
+                    --me->_viewer_count;
+                }
+            }
+            int prev = current;
+            current  = -1;
+            for (int i = 1; i <= viewer_max; ++i) {
+                int idx = (prev + i + viewer_max) % viewer_max;
+                if (viewers[idx]) {
+                    current = idx;
+                    break;
+                }
+            }
+            deadline = millis() + stream_frame_timeout_ms;
+        }
+        if (current < 0 || !viewers[current]) {
+            continue;
+        }
+        auto& viewer = viewers[current];
+        if (!stream_send(viewer->fd(), qd.bufdata, qd.len, deadline)) {
+            // Closed by the browser, or stalled past the frame deadline.
+            ESP_LOGI("stream", "viewer %d dropped (errno %d)", current, errno);
+            delete viewer;
+            viewer = nullptr;
+            --me->_viewer_count;
+        }
     }
     vTaskDelete(nullptr);
 }
@@ -648,20 +735,16 @@ bool screenshot_streamer_t::put_buf(const void* Pbuf, int len) {
     if (len) {
         _q_bufdata.len     = len;
         _q_bufdata.bufdata = (const uint8_t*)Pbuf;
-        xQueueSendToBack(_queue_bufdata, &_q_bufdata, portMAX_DELAY);
-        return true;
-    }
-    if (_wifi_client != nullptr) {
-        requestScreenShot(_wifi_client);
+        return pdPASS == xQueueSendToBack(_queue_bufdata, &_q_bufdata,
+                                          stream_queue_timeout_ms);
     }
     return true;
 }
 
 bool screenshot_streamer_t::initCapture(uint16_t width, uint16_t height) {
-    if (!_is_requested && !uxQueueMessagesWaiting(_queue_client)) {
+    if (_viewer_count == 0) {
         return false;
     }
-    _is_requested = false;
 
     if (_width != width || _height != height) {
         int num_channels          = 3;
@@ -685,9 +768,7 @@ bool screenshot_streamer_t::addQueue(M5Canvas* canvas, uint16_t y) {
     if (pdPASS != xQueueSendToBack(_queue_canvas, &queue_ss, 64)) {
         // ESP_LOGD("DEBUG","queue_timeout:y:%d", y);
         // 時間内にキューが空かなかった場合は失敗終了とする。
-        if (_wifi_client) {  // wifiクライアントが存続している場合は_is_requestedフラグをセットし、次回のフレームで処理が継続できるようにする
-            _is_requested = true;
-        }
+        // The next frame retries while viewers remain (initCapture).
         return false;
     }
     return true;
@@ -708,9 +789,7 @@ screenshot_streamer_t::process_result_t screenshot_streamer_t::processCapture(
         return pr_error;
     }
     if (queue_ss.y == 0) {
-        bool request  = uxQueueMessagesWaiting(_queue_client);
-        _is_requested = request;
-        if (!request) {
+        if (_viewer_count == 0) {
             xQueueReceive(_queue_canvas, &queue_ss, 0);
             return process_result_t::pr_nothing;
         }
@@ -720,7 +799,7 @@ screenshot_streamer_t::process_result_t screenshot_streamer_t::processCapture(
         _q_bufdata.bufdata = (const uint8_t*)headtext;
         _q_bufdata.len     = sizeof(headtext) - 1;
         _q_bufdata.y0      = true;
-        xQueueSendToBack(_queue_bufdata, &_q_bufdata, portMAX_DELAY);
+        xQueueSendToBack(_queue_bufdata, &_q_bufdata, stream_queue_timeout_ms);
         _q_bufdata.y0 = false;
 
         // JPEGエンコーダ再初期化 (初期設定部分を省略)
@@ -3263,7 +3342,7 @@ void setup(void) {
     // xTaskCreatePinnedToCore(screenshot_streamer_t::streamTask, "stream",
     // 2048, &screenshot_holder, 1, nullptr,
     //                         PRO_CPU_NUM);
-    xTaskCreate(screenshot_streamer_t::streamTask, "stream", 2048,
+    xTaskCreate(screenshot_streamer_t::streamTask, "stream", 3072,
                 &screenshot_holder, 1, nullptr);
 
     auto macaddr = draw_param.macaddr;

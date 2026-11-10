@@ -4,17 +4,29 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <atomic>
 
 #include <M5GFX.h>
 #include <WiFiClient.h>
 #include "jpg/jpge.h"
 
 class screenshot_streamer_t : public jpge::output_stream {
+   public:
+    // Number of browsers that can watch the stream at the same time (frames
+    // are sent to them in turn). One: each viewer costs Wi-Fi/TCP buffers,
+    // and with four the largest free heap block fell to ~6 KB, so /json's
+    // ~5 KB reply buffer could no longer be allocated (abort).
+    static constexpr const int viewer_max = 1;
+
+   private:
     QueueHandle_t _queue_canvas;
+    // New viewers (heap-allocated WiFiClient) handed from the web task to
+    // streamTask, which then owns and deletes them.
     QueueHandle_t _queue_client;
     QueueHandle_t _queue_bufdata;
 
-    WiFiClient* _wifi_client;
+    // Viewers owned by streamTask, plus those waiting in _queue_client.
+    std::atomic<int> _viewer_count{0};
 
     struct queue_ss_t {
         M5Canvas* canvas;
@@ -31,7 +43,6 @@ class screenshot_streamer_t : public jpge::output_stream {
     uint16_t _y      = 0;
     uint16_t _width  = 0;
     uint16_t _height = 0;
-    bool _is_requested;
 
     jpge::jpeg_encoder _jpeg_enc;
 
@@ -40,10 +51,13 @@ class screenshot_streamer_t : public jpge::output_stream {
 
     static void streamTask(void*);
 
-    bool isRequested(void) const {
-        return _is_requested;
-    };
-    void requestScreenShot(WiFiClient* client);
+    // Hands a connected client to streamTask, which keeps its own handle to
+    // the socket, so the caller may stop and reuse its client right away.
+    // Returns false when viewer_max viewers are already streaming.
+    bool addViewer(const WiFiClient& client);
+    bool hasFreeSlot(void) const {
+        return _viewer_count < viewer_max;
+    }
 
     // 新設
     bool initCapture(uint16_t width, uint16_t height);
