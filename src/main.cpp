@@ -3103,8 +3103,10 @@ static void wifiTask(void*) {
                     WiFi.softAPConfig(draw_param.net_apmode_ipaddr,
                                       draw_param.net_apmode_ipaddr,
                                       draw_param.net_apmode_subnet);
+                    // One station: the setup AP only serves the phone that
+                    // configures the device, and each station costs memory.
                     WiFi.softAP(draw_param.net_apmode_ssid,
-                                draw_param.net_apmode_pass, 1, false, 4);
+                                draw_param.net_apmode_pass, 1, false, 1);
                     // Always push the AP config to the driver so it derives
                     // the WPA2 PMK from the current SSID/passphrase.
                     //
